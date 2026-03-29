@@ -33,7 +33,7 @@ pub struct Config {
     /// Sqlite3 database to cache build information
     pub database: String,
 
-    /// List of [ConfigArtiface] to retrieve
+    /// List of [ConfigArtifact] to retrieve
     pub artifact: Vec<ConfigArtifact>,
 
     /// List of custom [TagView] to be rendered
@@ -56,7 +56,7 @@ pub struct ConfigArtifact {
     pub render: Option<Vec<String>>,
 }
 
-/// Represesnts one [crate::parse::Tag] view to be rendered
+/// Represents one [crate::parse::Tag] view to be rendered
 #[derive(Deserialize)]
 pub struct TagView {
     /// Name of the view

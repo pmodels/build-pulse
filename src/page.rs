@@ -28,7 +28,7 @@ where
         .map_err(Error::from)
 }
 
-/// Format [Option<BuildStatus>] to string
+/// Format [`Option<BuildStatus>`] to string
 #[inline]
 fn status_as_str(status: Option<BuildStatus>) -> &'static str {
     match status {
@@ -41,7 +41,7 @@ fn status_as_str(status: Option<BuildStatus>) -> &'static str {
     }
 }
 
-/// Format [Option<BuildStatus>] as class name
+/// Format [`Option<BuildStatus>`] as class name
 #[inline]
 fn status_as_class(status: Option<BuildStatus>) -> Option<&'static str> {
     match status {
