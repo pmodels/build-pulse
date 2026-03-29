@@ -25,6 +25,9 @@
             rustup
             sqlite
             uv
+
+            # docs
+            texlive.combined.scheme-full
           ];
 
           env = {
