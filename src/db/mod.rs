@@ -1,8 +1,11 @@
 //! [rusqlite] based ORM to cache build results.
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
+use std::path::Path;
+use std::thread;
 
 use rusqlite::{Connection, Params, Result, Row};
+use tokio::sync::{mpsc, oneshot};
 
 mod artifact;
 mod build;
@@ -156,33 +159,36 @@ macro_rules! for_all {
     };
 
     ($($method:tt)+) => {
-        for_all!([SimilarityInfo, Issue, Artifact, Run, JobBuild, Job, TagInfo] => $($method)+)
+        for_all!([SimilarityInfo, IssueInfo, Artifact, Run, JobBuild, Job, TagInfo] => $($method)+)
     };
 }
 
+/// Messages the [Database] object passes
+trait Message: Send {
+    /// Call closure on background thread with [Connection] and send back result
+    fn call(self: Box<Self>, conn: &mut Connection);
+}
+
+impl<F, R> Message for (F, oneshot::Sender<R>)
+where
+    F: FnOnce(&mut Connection) -> R + Send,
+    R: Send,
+{
+    fn call(self: Box<Self>, conn: &mut Connection) {
+        let (closure, tx) = *self;
+        tx.send(closure(conn));
+    }
+}
+
 /// Database object
+#[derive(Clone)]
 pub struct Database {
-    /// Internal [rusqlite] connection
-    conn: Connection,
-}
-
-/// Implicit deref to [Connection] from [Database]
-impl Deref for Database {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.conn
-    }
-}
-
-/// Implicit deref_mut to [Connection] from [Database]
-impl DerefMut for Database {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.conn
-    }
+    /// Sender to connection background thread
+    tx: mpsc::UnboundedSender<Box<dyn Message>>,
 }
 
 /// Represents an item `T` in [Database]
+#[derive(Debug, Copy, Clone)]
 pub struct InDatabase<T> {
     /// Row ID of `item`
     pub id: i64,
@@ -248,29 +254,62 @@ impl<T> Eq for InDatabase<T> {}
 
 impl Database {
     /// Open or create an `sqlite3` database at `path` returning [Database]
-    pub fn open(path: &str) -> Result<Database> {
-        // Enable REGEXP
-        rusqlite_regex::enable_auto_extension()?;
+    pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Box<dyn Message>>();
+        let (res_tx, res_rx) = oneshot::channel();
 
-        // try to open existing, otherwise create a new one
-        let db = Database {
-            conn: Connection::open(path)?,
-        };
+        // spawn a background thread to access the database
+        let path = path.as_ref().to_owned();
+        thread::spawn(move || {
+            // enable regex, then try to open existing file, otherwise create a new one
+            let mut conn = match rusqlite_regex::enable_auto_extension()
+                .and_then(|_| Connection::open(path))
+            {
+                Ok(c) => {
+                    res_tx.send(Ok(())).unwrap();
+                    c
+                }
+                Err(e) => {
+                    res_tx.send(Err(e)).unwrap();
+                    return;
+                }
+            };
+
+            // Handle calls
+            while let Some(msg) = rx.blocking_recv() {
+                msg.call(&mut conn);
+            }
+        });
+
+        // ensure successful
+        let db = res_rx.await.unwrap().map(|_| Self { tx })?;
 
         // create the necessary tables
-        for_all!(create_table(&db)?);
+        for_all!(create_table(&db).await?);
 
         Ok(db)
     }
 
+    /// Get an async context to the [Database]'s [Connection]
+    pub async fn call<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Connection) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Box::new((f, tx))).unwrap();
+
+        rx.await.unwrap()
+    }
+
     /// Purge all rows (but not tables) from [Database]
-    pub fn purge_cache(&self) -> Result<()> {
-        for_all!(delete_all(self)?);
+    pub async fn purge_cache(&self) -> Result<()> {
+        for_all!(delete_all(self).await?);
         Ok(())
     }
 }
 
-pub trait Schema: Sized {
+pub trait Schema: Send + Sized {
     const CREATE_TABLE: &'static str;
     const INSERT: &'static str;
     const SELECT_ONE: &'static str;
@@ -278,45 +317,57 @@ pub trait Schema: Sized {
     const DELETE_ALL: &'static str;
 
     /// Creates the table in [Database]
-    fn create_table(db: &Database) -> Result<usize> {
-        db.execute(Self::CREATE_TABLE, ())
+    async fn create_table(db: &Database) -> Result<usize> {
+        db.call(|conn| conn.execute(Self::CREATE_TABLE, ())).await
     }
 }
 
-pub trait Queryable<I = (), E = ()>: Schema {
+pub trait Queryable: Schema
+where
+    Self: 'static,
+{
     /// Convert [Row] to `Self` with params
-    fn map_row(params: I) -> impl FnMut(&Row) -> Result<InDatabase<Self>>;
+    fn map_row(row: &Row) -> Result<InDatabase<Self>>;
 
     /// Convert `self` to [Params] with `params`
-    fn as_params(&self, params: E) -> Result<impl Params>;
+    fn as_params(&self) -> Result<impl Params>;
 
     /// Insert `self` to [Database] with `params`
-    fn insert(self, db: &Database, params: E) -> Result<InDatabase<Self>> {
-        db.prepare_cached(Self::INSERT)?
-            .execute(self.as_params(params)?)?;
-        Ok(InDatabase::new(db.last_insert_rowid(), self))
+    async fn insert(self, db: &Database) -> Result<InDatabase<Self>> {
+        db.call(|conn| {
+            conn.prepare_cached(Self::INSERT)?
+                .execute(self.as_params()?)?;
+            Ok(InDatabase::new(conn.last_insert_rowid(), self))
+        })
+        .await
     }
 
-    /// Select one of `Self` from [Database] by `id` with `params`
-    fn select_one(db: &Database, id: i64, params: I) -> Result<InDatabase<Self>> {
-        db.prepare_cached(Self::SELECT_ONE)?
-            .query_one((id,), Self::map_row(params))
+    /// Select one of `Self` from [Database] by `id`
+    async fn select_one(db: &Database, id: i64) -> Result<InDatabase<Self>> {
+        db.call(move |conn| {
+            conn.prepare_cached(Self::SELECT_ONE)?
+                .query_one((id,), Self::map_row)
+        })
+        .await
     }
 
-    /// Select all of `Self` from [Database] with `params`
-    fn select_all(db: &Database, params: I) -> Result<Vec<InDatabase<Self>>> {
-        db.prepare_cached(Self::SELECT_ALL)?
-            .query_map((), Self::map_row(params))?
-            .collect()
+    /// Select all of `Self` from [Database]
+    async fn select_all(db: &Database) -> Result<Vec<InDatabase<Self>>> {
+        db.call(|conn| {
+            conn.prepare_cached(Self::SELECT_ALL)?
+                .query_and_then((), Self::map_row)?
+                .collect()
+        })
+        .await
     }
 
     /// Delete all of `Self` from [Database]
-    fn delete_all(db: &Database) -> Result<usize> {
-        db.execute(Self::DELETE_ALL, ())
+    async fn delete_all(db: &Database) -> Result<usize> {
+        db.call(|conn| conn.execute(Self::DELETE_ALL, ())).await
     }
 }
 
-pub trait Upsertable<I = (), E = ()>: Queryable<I, E> {
-    /// Upsert `self` to [Database] with `params`
-    fn upsert(self, db: &Database, params: E) -> Result<InDatabase<Self>>;
+pub trait Upsertable: Queryable {
+    /// Upsert `self` to [Database]
+    async fn upsert(self, db: &Database) -> Result<InDatabase<Self>>;
 }

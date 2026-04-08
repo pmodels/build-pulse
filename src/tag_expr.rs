@@ -2,7 +2,7 @@ use std::{fmt, ops::Deref};
 
 use chumsky::{pratt::*, prelude::*};
 use regex::Regex;
-use rusqlite::{Error, Params, ToSql, params_from_iter};
+use rusqlite::{Error, ToSql};
 use serde_json::to_value;
 
 use crate::{config::Severity, db::TagInfo};
@@ -131,8 +131,9 @@ impl TagExpr {
         }
     }
 
-    pub fn to_sql_select(&self) -> Result<(String, impl Params), Error> {
-        fn to_where_expr(expr: &TagExpr) -> Result<(String, Vec<Box<dyn ToSql>>), Error> {
+    pub fn to_sql_select(&self) -> Result<(String, Vec<Box<dyn ToSql + Send>>), Error> {
+        // FIXME: avoid all these allocations when making the select!
+        fn to_where_expr(expr: &TagExpr) -> Result<(String, Vec<Box<dyn ToSql + Send>>), Error> {
             match expr {
                 TagExpr::Not(e) => {
                     let (expr, params) = to_where_expr(e)?;
@@ -192,7 +193,7 @@ impl TagExpr {
                     )
                 "
             ),
-            params_from_iter(params),
+            params,
         ))
     }
 }

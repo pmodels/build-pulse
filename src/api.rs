@@ -109,9 +109,9 @@ impl Job for SparseJob {
 impl AsJob for SparseJob {
     fn as_job(&self, last_n: usize) -> crate::db::Job {
         crate::db::Job {
-            name: self.name.clone(),
+            name: self.name.as_str().into(),
             last_build: self.builds.iter().take(last_n).last().map(|b| b.number),
-            url: self.url.clone(),
+            url: self.url.as_str().into(),
         }
     }
 }
@@ -136,7 +136,7 @@ where
         let display_name = self.full_display_name_or_default();
         let status = self.build_status();
         Run {
-            url: self.url().to_string(),
+            url: self.url().into(),
             status,
             display_name: display_name.into(),
             log: match status {

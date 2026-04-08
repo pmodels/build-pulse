@@ -35,103 +35,113 @@ pub struct Statistics {
 
 impl Statistics {
     /// Gets [super::Database]'s [Statistics]
-    pub fn query(db: &super::Database) -> rusqlite::Result<Self> {
+    pub async fn query(db: &super::Database) -> rusqlite::Result<Self> {
         // calculate success/failures for latest runs
         let mut stats = db
-            .conn
-            .prepare(
-                "
-                SELECT status, id FROM runs
-                WHERE build_id IN (
-                        SELECT id FROM builds
-                        GROUP BY job_id
-                        HAVING MAX(number)
-                    )
-                ",
-            )?
-            .query_map((), |row| Ok((read_value!(row, 0), row.get(1)?)))?
-            .try_fold(Statistics::default(), |mut stats, res| {
-                let (status, id) = res?;
-                match status {
-                    Some(BuildStatus::Aborted) => stats.aborted.push(id),
-                    Some(BuildStatus::Failure) => stats.failures.push(id),
-                    Some(BuildStatus::NotBuilt) => stats.not_built.push(id),
-                    Some(BuildStatus::Success) => stats.successful.push(id),
-                    Some(BuildStatus::Unstable) => stats.unstable.push(id),
-                    _ => {}
-                };
+            .call(|conn| {
+                conn.prepare(
+                    "
+                    SELECT status, id FROM runs
+                    WHERE build_id IN (
+                            SELECT id FROM builds
+                            GROUP BY job_id
+                            HAVING MAX(number)
+                        )
+                    ",
+                )?
+                .query_map((), |row| Ok((read_value!(row, 0), row.get(1)?)))?
+                .try_fold(Statistics::default(), |mut stats, res| {
+                    let (status, id) = res?;
+                    match status {
+                        Some(BuildStatus::Aborted) => stats.aborted.push(id),
+                        Some(BuildStatus::Failure) => stats.failures.push(id),
+                        Some(BuildStatus::NotBuilt) => stats.not_built.push(id),
+                        Some(BuildStatus::Success) => stats.successful.push(id),
+                        Some(BuildStatus::Unstable) => stats.unstable.push(id),
+                        _ => {}
+                    };
 
-                Ok::<_, rusqlite::Error>(stats)
-            })?;
+                    Ok::<_, rusqlite::Error>(stats)
+                })
+            })
+            .await?;
 
         stats.successful_jobs = db
-            .conn
-            .prepare(
-                "
-                SELECT COUNT(*) FROM jobs
-                WHERE id IN (
-                        SELECT job_id FROM builds
-                        GROUP BY job_id
-                        HAVING MAX(number) AND status = ?
-                    )
-                ",
-            )?
-            .query_one((write_value!(BuildStatus::Success),), |row| row.get(0))?;
+            .call(|conn| {
+                conn.prepare(
+                    "
+                    SELECT COUNT(*) FROM jobs
+                    WHERE id IN (
+                            SELECT job_id FROM builds
+                            GROUP BY job_id
+                            HAVING MAX(number) AND status = ?
+                        )
+                    ",
+                )?
+                .query_one((write_value!(BuildStatus::Success),), |row| row.get(0))
+            })
+            .await?;
 
         stats.total_jobs = db
-            .conn
-            .prepare("SELECT COUNT(*) FROM jobs")?
-            .query_one((), |row| row.get(0))?;
+            .call(|conn| {
+                conn.prepare("SELECT COUNT(*) FROM jobs")?
+                    .query_one((), |row| row.get(0))
+            })
+            .await?;
 
         // don't count metadata issues in total
         stats.issues_found = db
-            .conn
-            .prepare(
-                "
-                SELECT COUNT(*) FROM issues
-                JOIN tags ON tags.id = issues.tag_id
-                JOIN runs ON runs.id = issues.run_id
-                WHERE tags.severity != ? AND runs.build_id IN (
-                        SELECT id FROM builds
-                        GROUP BY job_id
-                        HAVING MAX(number)
-                    )
-                ",
-            )?
-            .query_one((write_value!(Severity::Metadata),), |row| row.get(0))?;
+            .call(|conn| {
+                conn.prepare(
+                    "
+                    SELECT COUNT(*) FROM issues
+                    JOIN tags ON tags.id = issues.tag_id
+                    JOIN runs ON runs.id = issues.run_id
+                    WHERE tags.severity != ? AND runs.build_id IN (
+                            SELECT id FROM builds
+                            GROUP BY job_id
+                            HAVING MAX(number)
+                        )
+                    ",
+                )?
+                .query_one((write_value!(Severity::Metadata),), |row| row.get(0))
+            })
+            .await?;
 
         stats.unknown_runs = db
-            .conn
-            .prepare(
-                "
-                SELECT r.id FROM runs r
-                WHERE (
-                        r.status = ?
-                        OR r.status = ?
-                        OR r.status = ?
-                    ) AND r.build_id IN (
-                        SELECT id FROM builds
-                        GROUP BY job_id
-                        HAVING MAX(number)
-                    ) AND NOT EXISTS (
-                        SELECT 1 FROM issues
-                        JOIN tags ON tags.id = issues.tag_id
-                        WHERE
-                            issues.run_id = r.id
-                            AND tags.severity != ?
-                    )
-                ",
-            )?
-            .query_map(
-                (
-                    write_value!(Some(BuildStatus::Failure)),
-                    write_value!(Some(BuildStatus::Unstable)),
-                    write_value!(Some(BuildStatus::Aborted)),
-                    write_value!(Severity::Metadata),
-                ),
-                |row| row.get(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .call(|conn| {
+                conn.prepare(
+                    "
+                    SELECT r.id FROM runs r
+                    WHERE (
+                            r.status = ?
+                            OR r.status = ?
+                            OR r.status = ?
+                        ) AND r.build_id IN (
+                            SELECT id FROM builds
+                            GROUP BY job_id
+                            HAVING MAX(number)
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM issues
+                            JOIN tags ON tags.id = issues.tag_id
+                            WHERE
+                                issues.run_id = r.id
+                                AND tags.severity != ?
+                        )
+                    ",
+                )?
+                .query_map(
+                    (
+                        write_value!(Some(BuildStatus::Failure)),
+                        write_value!(Some(BuildStatus::Unstable)),
+                        write_value!(Some(BuildStatus::Aborted)),
+                        write_value!(Severity::Metadata),
+                    ),
+                    |row| row.get(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?;
 
         Ok(stats)
     }

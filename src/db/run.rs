@@ -1,17 +1,22 @@
+use std::str::from_utf8;
+
 use arcstr::ArcStr;
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use jenkins_api::build::BuildStatus;
 
 use crate::{
-    db::{JobBuild, Queryable, Upsertable},
+    config::Field,
+    db::{Artifact, Issue, IssueInfo, JobBuild, Queryable, TagInfo, Upsertable},
     read_value, schema,
     tag_expr::TagExpr,
     write_value,
 };
 
 /// [Run] stored in [super::Database]
+#[derive(Clone)]
 pub struct Run {
     /// Run url
-    pub url: String,
+    pub url: ArcStr,
 
     /// Build status
     pub status: Option<BuildStatus>,
@@ -42,25 +47,23 @@ schema! {
 }
 
 impl Queryable for Run {
-    fn map_row(_: ()) -> impl FnMut(&rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
-        |row| {
-            Ok(super::InDatabase::new(
-                row.get(0)?,
-                Run {
-                    url: row.get(1)?,
-                    status: read_value!(row, 2),
-                    display_name: row.get::<_, String>(3)?.into(),
-                    log: row.get::<_, Option<String>>(4)?.map(ArcStr::from),
-                    tag_schema: row.get::<_, Option<i64>>(5)?.map(i64::cast_unsigned),
-                    build_id: row.get(6)?,
-                },
-            ))
-        }
+    fn map_row(row: &rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
+        Ok(super::InDatabase::new(
+            row.get(0)?,
+            Run {
+                url: row.get::<_, String>(1)?.into(),
+                status: read_value!(row, 2),
+                display_name: row.get::<_, String>(3)?.into(),
+                log: row.get::<_, Option<String>>(4)?.map(ArcStr::from),
+                tag_schema: row.get::<_, Option<i64>>(5)?.map(i64::cast_unsigned),
+                build_id: row.get(6)?,
+            },
+        ))
     }
 
-    fn as_params(&self, _: ()) -> rusqlite::Result<impl rusqlite::Params> {
+    fn as_params(&self) -> rusqlite::Result<impl rusqlite::Params> {
         Ok((
-            &self.url,
+            self.url.as_str(),
             write_value!(self.status),
             self.display_name.as_str(),
             self.log.as_ref().map(|s| s.as_str()),
@@ -71,9 +74,11 @@ impl Queryable for Run {
 }
 
 impl Upsertable for Run {
-    fn upsert(self, db: &super::Database, params: ()) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached(
-            "
+    async fn upsert(self, db: &super::Database) -> rusqlite::Result<super::InDatabase<Self>> {
+        let url = self.url.clone();
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
                 INSERT INTO runs (
                     url,
                     status,
@@ -89,82 +94,147 @@ impl Upsertable for Run {
                         tag_schema = excluded.tag_schema,
                         build_id = excluded.build_id
                 ",
-        )?
-        .execute(self.as_params(params)?)?;
+            )?
+            .execute(self.as_params()?)
+        })
+        .await?;
 
-        Self::select_one_by_url(db, &self.url, ())
+        Self::select_one_by_url(db, url).await
     }
 }
 
 impl Run {
     /// Get a [Run] from [super::Database] by url
-    pub fn select_one_by_url(
+    pub async fn select_one_by_url(
         db: &super::Database,
-        url: &str,
-        params: (),
+        url: ArcStr,
     ) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached(
-            "
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
                 SELECT * FROM runs
                 WHERE url = ?
                 ",
-        )?
-        .query_one((url,), Self::map_row(params))
+            )?
+            .query_one((url.as_str(),), Self::map_row)
+        })
+        .await
     }
 
     /// Get all [Run]s by [super::JobBuild]
-    pub fn select_all_by_build(
+    pub async fn select_all_by_build(
         db: &super::Database,
         build: &super::InDatabase<JobBuild>,
-        params: (),
     ) -> rusqlite::Result<Vec<super::InDatabase<Self>>> {
-        db.prepare_cached(
-            "
+        let id = build.id;
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
                 SELECT * FROM runs
                 WHERE build_id = ?
                 ",
-        )?
-        .query_map((build.id,), Self::map_row(params))?
-        .collect()
+            )?
+            .query_and_then((id,), Self::map_row)?
+            .collect()
+        })
+        .await
     }
 
     /// Get all [Run] ID by [TagExpr] in [super::Database]
-    pub fn select_all_id_by_expr(
+    pub async fn select_all_id_by_expr(
         db: &super::Database,
         expr: &TagExpr,
     ) -> rusqlite::Result<Vec<i64>> {
         let (stmt, params) = expr.to_sql_select()?;
-        db.prepare(&stmt)?
-            .query_map(params, |row| row.get(0))?
-            .collect()
+        db.call(move |conn| {
+            conn.prepare(&stmt)?
+                .query_and_then(rusqlite::params_from_iter(params), |row| row.get(0))?
+                .collect()
+        })
+        .await
     }
 
     /// Get a [Run]'s display name by id in [super::Database]
-    pub fn select_one_display_name(db: &super::Database, id: i64) -> rusqlite::Result<String> {
-        db.prepare_cached("SELECT display_name FROM runs WHERE id = ?")?
-            .query_one((id,), |row| row.get(0))
+    pub async fn select_one_display_name(
+        db: &super::Database,
+        id: i64,
+    ) -> rusqlite::Result<String> {
+        db.call(move |conn| {
+            conn.prepare_cached("SELECT display_name FROM runs WHERE id = ?")?
+                .query_one((id,), |row| row.get(0))
+        })
+        .await
     }
 
     /// Get a [Run]'s url by id in [super::Database]
-    pub fn select_one_url(db: &super::Database, id: i64) -> rusqlite::Result<String> {
-        db.prepare_cached("SELECT url FROM runs WHERE id = ?")?
-            .query_one((id,), |row| row.get(0))
+    pub async fn select_one_url(db: &super::Database, id: i64) -> rusqlite::Result<String> {
+        db.call(move |conn| {
+            conn.prepare_cached("SELECT url FROM runs WHERE id = ?")?
+                .query_one((id,), |row| row.get(0))
+        })
+        .await
     }
 
     /// Check whether or not there are untagged [Run]s in [super::Database]
-    pub fn has_untagged(db: &super::Database) -> rusqlite::Result<bool> {
-        db.prepare_cached("SELECT 1 FROM runs WHERE tag_schema IS NULL")?
-            .exists(())
+    pub async fn has_untagged(db: &super::Database) -> rusqlite::Result<bool> {
+        db.call(|conn| {
+            conn.prepare_cached("SELECT 1 FROM runs WHERE tag_schema IS NULL")?
+                .exists(())
+        })
+        .await
     }
 
     /// Update the [crate::parse::TagSet] schema for all [Run]s in [super::Database]
-    pub fn update_all_tag_schema(
+    pub async fn update_all_tag_schema(
         db: &super::Database,
         new_schema: Option<u64>,
     ) -> rusqlite::Result<usize> {
-        db.execute(
-            "UPDATE runs SET tag_schema = ?",
-            (new_schema.map(u64::cast_signed),),
-        )
+        db.call(move |conn| {
+            conn.execute(
+                "UPDATE runs SET tag_schema = ?",
+                (new_schema.map(u64::cast_signed),),
+            )
+        })
+        .await
+    }
+}
+
+impl super::InDatabase<Run> {
+    /// Get a [Run]'s [Issue]s in [super::Database]
+    pub async fn select_all_issues(
+        &self,
+        db: &super::Database,
+        include_metadata: bool,
+    ) -> rusqlite::Result<Vec<super::InDatabase<Issue>>> {
+        IssueInfo::select_all_by_run(db, self, include_metadata)
+            .and_then(|issues| async {
+                futures::stream::iter(issues)
+                    .then(|i| async {
+                        match TagInfo::select_one(db, i.tag_id).await?.field {
+                            Field::Console => {
+                                self.log
+                                    .as_ref()
+                                    .map_or(Err(rusqlite::Error::InvalidQuery), |l| {
+                                        Ok(i.into_issue(l))
+                                    })
+                            }
+                            Field::RunName => Ok(i.into_issue(&self.display_name)),
+                            Field::Artifact => {
+                                let artifact_id =
+                                    i.artifact_id.ok_or(rusqlite::Error::InvalidQuery)?;
+                                Ok(i.into_issue(
+                                    // TODO: share Vec<u8> contents somehow?
+                                    &from_utf8(
+                                        &Artifact::select_one(db, artifact_id).await?.contents,
+                                    )
+                                    .map(ArcStr::from)?,
+                                ))
+                            }
+                        }
+                    })
+                    .try_collect()
+                    .await
+            })
+            .await
     }
 }

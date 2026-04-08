@@ -1,5 +1,5 @@
 //! HTML report generation using [maud] templating.
-use std::{collections::HashMap, str::from_utf8_unchecked, time::SystemTime};
+use std::{cmp::Reverse, collections::HashMap, str::from_utf8_unchecked, time::SystemTime};
 
 use anyhow::{Error, Result};
 use jenkins_api::build::BuildStatus;
@@ -9,8 +9,8 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use crate::{
     config::{Severity, TagView},
     db::{
-        Artifact, BlobFormat, Database, InDatabase, Issue, Job, JobBuild, Queryable, Run,
-        Similarity, Statistics, TagInfo,
+        Artifact, BlobFormat, Database, InDatabase, Job, JobBuild, Queryable, Run, Similarity,
+        Statistics, TagInfo,
     },
     tag_expr::TagExpr,
 };
@@ -64,17 +64,17 @@ fn severity_as_class(severity: Severity) -> Option<&'static str> {
 }
 
 /// Render a [crate::api::SparseJob]
-fn render_job(job: &InDatabase<Job>, db: &Database, tz: UtcOffset) -> Result<Markup> {
+async fn render_job(job: &InDatabase<Job>, db: &Database, tz: UtcOffset) -> Result<Markup> {
     Ok(html! {
         h2 {
             a href=(job.url) {
                 (job.name)
             }
         }
-        @if let Some((last_build, rest)) = JobBuild::select_all_by_job(db, job.id, ())?.split_first() {
-            (render_build(&last_build, db, tz, true)?)
+        @if let Some((last_build, rest)) = JobBuild::select_all_by_job(db, job.id).await?.split_first() {
+            (render_build(&last_build, db, tz, true).await?)
             @for build in rest {
-                (render_build(&build, db, tz, false)?)
+                (render_build(&build, db, tz, false).await?)
             }
         } @else {
             p {
@@ -85,13 +85,13 @@ fn render_job(job: &InDatabase<Job>, db: &Database, tz: UtcOffset) -> Result<Mar
 }
 
 /// Render a [JobBuild]
-fn render_build(
+async fn render_build(
     build: &InDatabase<JobBuild>,
     db: &Database,
     tz: UtcOffset,
     latest: bool,
 ) -> Result<Markup> {
-    let mut runs = Run::select_all_by_build(db, &build, ())?;
+    let mut runs = Run::select_all_by_build(db, &build).await?;
     runs.sort_by_cached_key(|r| match r.status {
         Some(BuildStatus::Failure) => 0,
         Some(BuildStatus::Unstable) => 1,
@@ -127,7 +127,7 @@ fn render_build(
                 }
             }
             @for run in runs {
-                (render_run(&run, db)?)
+                (render_run(&run, db).await?)
                 br;
             }
         }
@@ -135,8 +135,8 @@ fn render_build(
 }
 
 /// Render a [Run]
-fn render_run(run: &InDatabase<Run>, db: &Database) -> Result<Markup> {
-    let issues = Issue::select_all_not_metadata(db, (db, run))?;
+async fn render_run(run: &InDatabase<Run>, db: &Database) -> Result<Markup> {
+    let issues = run.select_all_issues(db, false).await?;
     Ok(html! {
         table {
             tr #(run.id) class=[status_as_class(run.status)] {
@@ -158,7 +158,7 @@ fn render_run(run: &InDatabase<Run>, db: &Database) -> Result<Markup> {
             }
             tr #(run.id) class=[status_as_class(run.status)] {
                 td { // tags
-                    @let tags = TagInfo::select_all_by_run(db, run, ())?;
+                    @let tags = TagInfo::select_all_by_run(db, run).await?;
                     @if !tags.is_empty() {
                         @for t in tags {
                             code title=(t.desc) {
@@ -212,7 +212,7 @@ fn render_run(run: &InDatabase<Run>, db: &Database) -> Result<Markup> {
                     }
                 }
             }
-            @let artifacts = Artifact::select_all_by_run(db, run.id, ())?;
+            @let artifacts = Artifact::select_all_by_run(db, run.id).await?;
             @for a in artifacts {
                 tr class=[status_as_class(run.status)] {
                     td colspan="3" { // artifacts
@@ -240,8 +240,8 @@ fn render_run(run: &InDatabase<Run>, db: &Database) -> Result<Markup> {
 }
 
 /// Render [crate::db::Statistics]
-fn render_stats(db: &Database) -> Result<Markup> {
-    let stats = Statistics::query(db)?;
+async fn render_stats(db: &Database) -> Result<Markup> {
+    let stats = Statistics::query(db).await?;
     Ok(html! {
         h3 {
             "Job Statistics"
@@ -265,7 +265,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                     "Failures"
                 }
                 td {
-                    (render_run_ids(stats.failures.iter(), db)?)
+                    (render_run_ids(stats.failures.iter(), db).await?)
                 }
             }
             tr {
@@ -273,7 +273,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                     "Unstable"
                 }
                 td {
-                    (render_run_ids(stats.unstable.iter(), db)?)
+                    (render_run_ids(stats.unstable.iter(), db).await?)
                 }
             }
             tr {
@@ -281,7 +281,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                     "Healthy"
                 }
                 td {
-                    (render_run_ids(stats.successful.iter(), db)?)
+                    (render_run_ids(stats.successful.iter(), db).await?)
                 }
             }
             tr {
@@ -289,7 +289,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                     "Aborted"
                 }
                 td {
-                    (render_run_ids(stats.aborted.iter(), db)?)
+                    (render_run_ids(stats.aborted.iter(), db).await?)
                 }
             }
             tr {
@@ -297,7 +297,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                     "Not Built"
                 }
                 td {
-                    (render_run_ids(stats.not_built.iter(), db)?)
+                    (render_run_ids(stats.not_built.iter(), db).await?)
                 }
             }
             tr {
@@ -341,7 +341,7 @@ fn render_stats(db: &Database) -> Result<Markup> {
                 }
                 td {
                     b {
-                        (render_run_ids(stats.unknown_runs.iter(), db)?)
+                        (render_run_ids(stats.unknown_runs.iter(), db).await?)
                     }
                 }
             }
@@ -350,15 +350,19 @@ fn render_stats(db: &Database) -> Result<Markup> {
 }
 
 /// Render [crate::db::Similarity]
-fn render_similarities(db: &Database) -> Result<Markup> {
-    let similarities: HashMap<_, Vec<_>> =
-        Similarity::query_all(db, ())?
-            .into_iter()
-            .fold(HashMap::new(), |mut acc, s| {
-                acc.entry(s.tag.severity).or_default().push(s);
+async fn render_similarities(db: &Database) -> Result<Markup> {
+    let mut similarities: HashMap<_, Vec<_>> = Similarity::query_all(db)
+        .await?
+        .into_iter()
+        .filter(|s| s.related.len() > 1) // ignore similarities within the same run
+        .fold(HashMap::new(), |mut acc, s| {
+            acc.entry(s.tag.severity).or_default().push(s);
 
-                acc
-            });
+            acc
+        });
+    similarities
+        .values_mut()
+        .for_each(|s| s.sort_by_cached_key(|s| Reverse(s.related.len())));
 
     Ok(html! {
         h4 {
@@ -385,7 +389,7 @@ fn render_similarities(db: &Database) -> Result<Markup> {
                                     }
                                 }
                                 td {
-                                    (render_run_ids(s.related.iter(), db)?)
+                                    (render_run_ids(s.related.iter(), db).await?)
                                 }
                             }
                             tr class=[severity_as_class(s.tag.severity)] {
@@ -409,14 +413,14 @@ fn render_similarities(db: &Database) -> Result<Markup> {
 }
 
 /// Render a [TagView]
-fn render_view(view: &TagView, db: &Database) -> Result<Markup> {
+async fn render_view(view: &TagView, db: &Database) -> Result<Markup> {
     let expr = match TagExpr::parse(&view.expr) {
         Ok(expr) => Ok(expr),
         Err(e) => Err(Error::msg(
             e.iter().fold(String::new(), |acc, e| format!("{acc}\n{e}")),
         )),
     }?;
-    let rows = expr.eval_rows(&TagInfo::select_all(db, ())?);
+    let rows = expr.eval_rows(&TagInfo::select_all(db).await?);
 
     Ok(html! {
         h4 {
@@ -424,7 +428,7 @@ fn render_view(view: &TagView, db: &Database) -> Result<Markup> {
         }
         table class="view" {
             @for expr in rows {
-                @let matches = Run::select_all_id_by_expr(db, &expr)?;
+                @let matches = Run::select_all_id_by_expr(db, &expr).await?;
                 @if !matches.is_empty() {
                     tr {
                         td {
@@ -433,7 +437,7 @@ fn render_view(view: &TagView, db: &Database) -> Result<Markup> {
                             }
                         }
                         td {
-                            (render_run_ids(matches.iter(), db)?)
+                            (render_run_ids(matches.iter(), db).await?)
                         }
                     }
                 }
@@ -443,7 +447,7 @@ fn render_view(view: &TagView, db: &Database) -> Result<Markup> {
 }
 
 /// Render a list of [Run] ids as their display name
-fn render_run_ids<'a, T>(ids: T, db: &Database) -> Result<Markup>
+async fn render_run_ids<'a, T>(ids: T, db: &Database) -> Result<Markup>
 where
     T: ExactSizeIterator + Iterator<Item = &'a i64>,
 {
@@ -459,7 +463,7 @@ where
                     @for id in ids {
                         li {
                             a href={"#" (id)} {
-                                (Run::select_one_display_name(db, *id)?)
+                                (Run::select_one_display_name(db, *id).await?)
                             }
                         }
                     }
@@ -472,7 +476,7 @@ where
 }
 
 /// Render an HTML report for [Database] info
-pub fn render(db: &Database, views: &[TagView], tz: UtcOffset) -> Result<Markup> {
+pub async fn render(db: &Database, views: &[TagView], tz: UtcOffset) -> Result<Markup> {
     Ok(html! {
         (DOCTYPE)
         html lang="en" {
@@ -487,13 +491,13 @@ pub fn render(db: &Database, views: &[TagView], tz: UtcOffset) -> Result<Markup>
                 h1 {
                     "build-pulse"
                 }
-                (render_stats(db)?)
-                (render_similarities(db)?)
+                (render_stats(db).await?)
+                (render_similarities(db).await?)
                 @for view in views {
-                    (render_view(view, db)?)
+                    (render_view(view, db).await?)
                 }
-                @for job in Job::select_all(db, ())? {
-                    (render_job(&job, db, tz)?)
+                @for job in Job::select_all(db).await? {
+                    (render_job(&job, db, tz).await?)
                 }
                 p {
                     "Report generated on "

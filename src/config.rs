@@ -66,7 +66,7 @@ pub struct TagView {
     pub expr: String,
 }
 
-/// Represents one tag to be loaded as [crate::parse::Tag]
+/// Represents one tag to be loaded as [crate::db::TagInfo]
 #[derive(Deserialize)]
 pub struct ConfigTag {
     /// Unique name of the tag

@@ -6,6 +6,7 @@ use crate::{
 };
 
 /// [JobBuild] in [super::Database]
+#[derive(Clone)]
 pub struct JobBuild {
     /// Build url
     pub url: String,
@@ -35,22 +36,20 @@ schema! {
 }
 
 impl Queryable for JobBuild {
-    fn map_row(_: ()) -> impl FnMut(&rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
-        |row| {
-            Ok(super::InDatabase::new(
-                row.get(0)?,
-                JobBuild {
-                    url: row.get(1)?,
-                    status: read_value!(row, 2),
-                    number: row.get(3)?,
-                    timestamp: row.get(4).map(i64::cast_unsigned)?,
-                    job_id: row.get(5)?,
-                },
-            ))
-        }
+    fn map_row(row: &rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
+        Ok(super::InDatabase::new(
+            row.get(0)?,
+            JobBuild {
+                url: row.get(1)?,
+                status: read_value!(row, 2),
+                number: row.get(3)?,
+                timestamp: row.get(4).map(i64::cast_unsigned)?,
+                job_id: row.get(5)?,
+            },
+        ))
     }
 
-    fn as_params(&self, _: ()) -> rusqlite::Result<impl rusqlite::Params> {
+    fn as_params(&self) -> rusqlite::Result<impl rusqlite::Params> {
         Ok((
             &self.url,
             write_value!(self.status),
@@ -62,105 +61,118 @@ impl Queryable for JobBuild {
 }
 
 impl Upsertable for JobBuild {
-    fn upsert(self, db: &super::Database, params: ()) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached(
-            "
-            INSERT INTO builds (
-                url,
-                status,
-                number,
-                timestamp,
-                job_id
-            ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(url) DO UPDATE SET
-                    status = excluded.status,
-                    number = excluded.number,
-                    timestamp = excluded.timestamp,
-                    job_id = excluded.job_id
-            ",
-        )?
-        .execute(self.as_params(params)?)?;
+    async fn upsert(self, db: &super::Database) -> rusqlite::Result<super::InDatabase<Self>> {
+        let number = self.number;
+        let job_id = self.job_id;
 
-        Self::select_one_by_job(db, self.job_id, self.number, ())
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
+                INSERT INTO builds (
+                    url,
+                    status,
+                    number,
+                    timestamp,
+                    job_id
+                ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        status = excluded.status,
+                        number = excluded.number,
+                        timestamp = excluded.timestamp,
+                        job_id = excluded.job_id
+                ",
+            )?
+            .execute(self.as_params()?)
+        })
+        .await?;
+
+        Self::select_one_by_job(db, job_id, number).await
     }
 }
 
 impl JobBuild {
     /// Get a [JobBuild] from [super::Database] by [super::Job] id and build number
-    pub fn select_one_by_job(
+    pub async fn select_one_by_job(
         db: &super::Database,
         job_id: i64,
         number: u32,
-        params: (),
     ) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached(
-            "
-            SELECT * FROM builds
-            WHERE job_id = ?
-            AND number = ?
-            ORDER BY number DESC
-            ",
-        )?
-        .query_one((job_id, number), Self::map_row(params))
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
+                SELECT * FROM builds
+                WHERE job_id = ?
+                AND number = ?
+                ORDER BY number DESC
+                ",
+            )?
+            .query_one((job_id, number), Self::map_row)
+        })
+        .await
     }
 
     /// Get all [JobBuild] from [super::Database] by [super::Job]
-    pub fn select_all_by_job(
+    pub async fn select_all_by_job(
         db: &super::Database,
         job_id: i64,
-        params: (),
     ) -> rusqlite::Result<Vec<super::InDatabase<Self>>> {
-        db.prepare_cached(
-            "
-            SELECT * FROM builds
-            WHERE job_id = ?
-            ORDER BY number DESC
-            ",
-        )?
-        .query_map((job_id,), Self::map_row(params))?
-        .collect()
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
+                SELECT * FROM builds
+                WHERE job_id = ?
+                ORDER BY number DESC
+                ",
+            )?
+            .query_map((job_id,), Self::map_row)?
+            .collect()
+        })
+        .await
     }
 
     /// Remove all [JobBuild]s which aren't referenced by [super::Job] from [super::Database]
-    pub fn delete_all_orphan(db: &super::Database) -> rusqlite::Result<()> {
-        db.execute_batch(
-            "
-            BEGIN;
-            DELETE FROM similarities WHERE similarity_hash IN (
-                SELECT DISTINCT similarities.similarity_hash FROM similarities
-                JOIN issues ON issues.id = similarities.issue_id
-                JOIN runs ON runs.id = issues.run_id
-                JOIN builds ON builds.id = runs.build_id
-                JOIN jobs ON jobs.id = builds.job_id
-                WHERE number < last_build
-            );
-            DELETE FROM issues WHERE id IN (
-                SELECT issues.id FROM issues
-                JOIN runs ON runs.id = issues.run_id
-                JOIN builds ON builds.id = runs.build_id
-                JOIN jobs ON jobs.id = builds.job_id
-                WHERE number < last_build
-            );
-            DELETE FROM artifacts WHERE id IN (
-                SELECT artifacts.id FROM artifacts
-                JOIN runs ON runs.id = artifacts.run_id
-                JOIN builds ON builds.id = runs.build_id
-                JOIN jobs ON jobs.id = builds.job_id
-                WHERE number < last_build
-            );
-            DELETE FROM runs WHERE id IN (
-                SELECT runs.id FROM runs
-                JOIN builds ON builds.id = runs.build_id
-                JOIN jobs ON jobs.id = builds.job_id
-                WHERE number < last_build
-            );
-            DELETE FROM builds WHERE id IN (
-                SELECT builds.id FROM builds
-                JOIN jobs ON jobs.id = builds.job_id
-                WHERE number < last_build
-            );
-            COMMIT;
-            ",
-        )
+    pub async fn delete_all_orphan(db: &super::Database) -> rusqlite::Result<()> {
+        db.call(|conn| {
+            conn.execute_batch(
+                "
+                BEGIN;
+                DELETE FROM similarities WHERE similarity_hash IN (
+                    SELECT DISTINCT similarities.similarity_hash FROM similarities
+                    JOIN issues ON issues.id = similarities.issue_id
+                    JOIN runs ON runs.id = issues.run_id
+                    JOIN builds ON builds.id = runs.build_id
+                    JOIN jobs ON jobs.id = builds.job_id
+                    WHERE number < last_build
+                );
+                DELETE FROM issues WHERE id IN (
+                    SELECT issues.id FROM issues
+                    JOIN runs ON runs.id = issues.run_id
+                    JOIN builds ON builds.id = runs.build_id
+                    JOIN jobs ON jobs.id = builds.job_id
+                    WHERE number < last_build
+                );
+                DELETE FROM artifacts WHERE id IN (
+                    SELECT artifacts.id FROM artifacts
+                    JOIN runs ON runs.id = artifacts.run_id
+                    JOIN builds ON builds.id = runs.build_id
+                    JOIN jobs ON jobs.id = builds.job_id
+                    WHERE number < last_build
+                );
+                DELETE FROM runs WHERE id IN (
+                    SELECT runs.id FROM runs
+                    JOIN builds ON builds.id = runs.build_id
+                    JOIN jobs ON jobs.id = builds.job_id
+                    WHERE number < last_build
+                );
+                DELETE FROM builds WHERE id IN (
+                    SELECT builds.id FROM builds
+                    JOIN jobs ON jobs.id = builds.job_id
+                    WHERE number < last_build
+                );
+                COMMIT;
+                ",
+            )
+        })
+        .await
     }
 }

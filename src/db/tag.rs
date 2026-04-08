@@ -1,34 +1,24 @@
+use arcstr::ArcStr;
+
 use crate::{
-    config::{Field, Severity},
+    config::{ConfigTag, Field, Severity},
     db::{Queryable, Run, Upsertable},
-    parse::{Tag, TagSet},
     read_value, schema, write_value,
 };
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct TagInfo {
     /// Name of [Tag]
-    pub name: String,
+    pub name: ArcStr,
 
     /// Description of [Tag]
-    pub desc: String,
+    pub desc: ArcStr,
 
     /// Field of [Tag]
     pub field: Field,
 
     /// Severity of [Tag]
     pub severity: Severity,
-}
-
-impl From<&Tag> for TagInfo {
-    fn from(value: &Tag) -> Self {
-        TagInfo {
-            name: value.name.clone(),
-            desc: value.desc.clone(),
-            field: value.from,
-            severity: value.severity,
-        }
-    }
 }
 
 schema! {
@@ -41,25 +31,34 @@ schema! {
     }
 }
 
-impl Queryable for TagInfo {
-    fn map_row(_: ()) -> impl FnMut(&rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
-        |row| {
-            Ok(super::InDatabase::new(
-                row.get(0)?,
-                Self {
-                    name: row.get(1)?,
-                    desc: row.get(2)?,
-                    field: read_value!(row, 3),
-                    severity: read_value!(row, 4),
-                },
-            ))
+impl From<ConfigTag> for TagInfo {
+    fn from(value: ConfigTag) -> Self {
+        Self {
+            name: value.name.into(),
+            desc: value.desc.into(),
+            field: value.from,
+            severity: value.severity,
         }
     }
+}
 
-    fn as_params(&self, _: ()) -> rusqlite::Result<impl rusqlite::Params> {
+impl Queryable for TagInfo {
+    fn map_row(row: &rusqlite::Row) -> rusqlite::Result<super::InDatabase<Self>> {
+        Ok(super::InDatabase::new(
+            row.get(0)?,
+            Self {
+                name: row.get::<_, String>(1)?.into(),
+                desc: row.get::<_, String>(2)?.into(),
+                field: read_value!(row, 3),
+                severity: read_value!(row, 4),
+            },
+        ))
+    }
+
+    fn as_params(&self) -> rusqlite::Result<impl rusqlite::Params> {
         Ok((
-            &self.name,
-            &self.desc,
+            self.name.as_str(),
+            self.desc.as_str(),
             write_value!(self.field),
             write_value!(self.severity),
         ))
@@ -67,74 +66,72 @@ impl Queryable for TagInfo {
 }
 
 impl Upsertable for TagInfo {
-    fn upsert(self, db: &super::Database, params: ()) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached(
-            "
-            INSERT INTO tags (name, desc, field, severity) VALUES (?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    desc = excluded.desc,
-                    field = excluded.field,
-                    severity = excluded.severity
-            ",
-        )?
-        .execute(self.as_params(params)?)?;
+    async fn upsert(self, db: &super::Database) -> rusqlite::Result<super::InDatabase<Self>> {
+        let name = self.name.clone();
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
+                INSERT INTO tags (name, desc, field, severity) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        desc = excluded.desc,
+                        field = excluded.field,
+                        severity = excluded.severity
+                ",
+            )?
+            .execute(self.as_params()?)
+        })
+        .await?;
 
-        Self::select_one_by_name(db, &self.name, ())
+        Self::select_one_by_name(db, name).await
     }
 }
 
 impl TagInfo {
     /// Get a [TagInfo] from [super::Database] by name
-    pub fn select_one_by_name(
+    pub async fn select_one_by_name(
         db: &super::Database,
-        name: &str,
-        params: (),
+        name: ArcStr,
     ) -> rusqlite::Result<super::InDatabase<Self>> {
-        db.prepare_cached("SELECT * FROM tags WHERE name = ?")?
-            .query_one((name,), Self::map_row(params))
+        db.call(move |conn| {
+            conn.prepare_cached("SELECT * FROM tags WHERE name = ?")?
+                .query_one((name.as_str(),), Self::map_row)
+        })
+        .await
     }
 
     /// Get all [TagInfo]s from [Run]
-    pub fn select_all_by_run(
+    pub async fn select_all_by_run(
         db: &super::Database,
         run: &super::InDatabase<Run>,
-        params: (),
     ) -> rusqlite::Result<Vec<super::InDatabase<Self>>> {
-        db.prepare_cached(
-            "
+        let id = run.id;
+        db.call(move |conn| {
+            conn.prepare_cached(
+                "
                 SELECT DISTINCT tags.id, name, desc, field, severity FROM tags
                 JOIN issues ON tags.id = issues.tag_id
                 WHERE issues.run_id = ?
                 ",
-        )?
-        .query_map((run.id,), Self::map_row(params))?
-        .collect()
-    }
-
-    /// Upsert a [TagSet] into [super::Database]
-    pub fn upsert_tag_set(
-        db: &super::Database,
-        tags: TagSet<Tag>,
-        params: (),
-    ) -> rusqlite::Result<TagSet<super::InDatabase<Tag>>> {
-        tags.try_swap_tags(|t| {
-            Ok(super::InDatabase::new(
-                TagInfo::from(&t).upsert(db, params)?.id,
-                t,
-            ))
+            )?
+            .query_map((id,), Self::map_row)?
+            .collect()
         })
+        .await
     }
 
     /// Remove all [Tag]s which aren't referenced by [super::Issue]s from [super::Database]
-    pub fn delete_all_orphan(db: &super::Database) -> rusqlite::Result<usize> {
-        db.execute(
-            "
-            DELETE FROM tags WHERE NOT EXISTS (
-                SELECT 1 FROM issues
-                WHERE tags.id = issues.tag_id
+    pub async fn delete_all_orphan(db: &super::Database) -> rusqlite::Result<usize> {
+        db.call(|conn| {
+            conn.execute(
+                "
+                DELETE FROM tags WHERE NOT EXISTS (
+                    SELECT 1 FROM issues
+                    WHERE tags.id = issues.tag_id
+                )
+                ",
+                (),
             )
-            ",
-            (),
-        )
+        })
+        .await
     }
 }
